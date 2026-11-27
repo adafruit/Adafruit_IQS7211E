@@ -5,8 +5,6 @@
  */
 #include "Adafruit_IQS7211E.h"
 
-#include "Adafruit_IQS7211E_Config.h"
-
 /** @brief Construct an IQS7211E interface without touching the bus. */
 Adafruit_IQS7211E::Adafruit_IQS7211E() {}
 
@@ -22,6 +20,8 @@ Adafruit_IQS7211E::~Adafruit_IQS7211E() {
  * No MCU pull-up or interrupt is enabled. Keep the pad untouched during
  * begin().
  * @return True after product validation, settings upload and successful ATI.
+ * If calibration fails after configuration, setters remain available so the
+ * application can adjust the settings and call calibrate() again.
  * @note Defaults: active mode, 20 ms reports, 0-1000 coordinates, two fingers,
  * no gestures or low-power modes. AVR Wire timeout is set to 250 ms because
  * the chip stretches SCL. Other cores must support appropriate clock
@@ -29,8 +29,14 @@ Adafruit_IQS7211E::~Adafruit_IQS7211E() {
  */
 bool Adafruit_IQS7211E::begin(TwoWire* wire, int16_t readyPin) {
   _initialized = false;
+  _configuring = false;
+  _configurationFailed = false;
   _validData = false;
-  _readyPin = readyPin;
+  // Keep an existing RDY pin long enough to leave request mode, even when
+  // the caller is reinitializing into polling mode with the default -1.
+  if (!_communicationRequest || readyPin >= 0) {
+    _readyPin = readyPin;
+  }
   delete _i2c;
   _i2c = new Adafruit_I2CDevice(IQS7211E_I2C_ADDRESS, wire);
   if (!_i2c || !_i2c->begin(false)) {
@@ -45,6 +51,25 @@ bool Adafruit_IQS7211E::begin(TwoWire* wire, int16_t readyPin) {
     pinMode(_readyPin, INPUT);
   }
 
+  // Reinitialization must also work after enabling explicit requests. The
+  // old transport mode remains in force until reset() replaces it below.
+  if (_communicationRequest) {
+    if (_readyPin < 0) {
+      return argumentError();
+    }
+    uint32_t start = millis();
+    while (!prepareCommunication(false)) {
+      if (_error != IQS7211E_ERROR_NOT_READY) {
+        return false;
+      }
+      if (millis() - start >= 3000) {
+        _error = IQS7211E_ERROR_TIMEOUT;
+        return false;
+      }
+      delay(1);
+    }
+  }
+
   // The product number, not an ACK alone, identifies the peripheral.
   if (getProductNumber() != IQS7211E_PRODUCT_NUMBER) {
     _error = IQS7211E_ERROR_DEVICE;
@@ -53,15 +78,154 @@ bool Adafruit_IQS7211E::begin(TwoWire* wire, int16_t readyPin) {
   if (!reset()) {
     return false;
   }
-  if (!loadSettings()) {
+  _readyPin = readyPin;
+  // Establish an explicit window before replacing the complete writable map
+  // (datasheet section 10.1.2). No partially configured sensor is scanned.
+  Adafruit_BusIO_Register config(_i2c, IQS7211E_REG_CONFIG, 2, LSBFIRST);
+  if (!config.write(IQS7211E_CONFIG_POLLING)) {
     _error = IQS7211E_ERROR_I2C;
+    return false;
+  }
+  _commandTermination = true;
+  _communicationRequest = false;
+  _configuring = true;
+  _configurationFailed = false;
+
+  // Clear reserved bits as well as writable settings. Keep communication
+  // control and its timeout intact until their named setters run below.
+  for (uint8_t address = IQS7211E_REG_CONFIG_START;
+       address <= IQS7211E_REG_GESTURE_SETTINGS; address++) {
+    if (address == IQS7211E_REG_CONFIG ||
+        address == IQS7211E_REG_COMMUNICATION_TIMEOUT) {
+      continue;
+    }
+    Adafruit_BusIO_Register setting(_i2c, address, 2, LSBFIRST);
+    if (!finishSetting(setting.write((uint16_t)0))) {
+      endConfiguration();
+      return false;
+    }
+  }
+
+  // Calibration and acquisition defaults for the Adafruit 7 TX by 6 RX pad.
+  bool configured =
+      setALPCompensation(IQS7211E_ENGINE_A, 0) &&
+      setALPCompensation(IQS7211E_ENGINE_B, 0) && setATICoarseDivider(1) &&
+      setATICoarseMultiplier(4) && setATIFineDivider(5) &&
+      setATICompensationDivider(6) && setATIDriftLimit(50) &&
+      setATITarget(300) && setMinimumCountReATI(50) &&
+      setATICoarseDivider(3, IQS7211E_ALP) &&
+      setATICoarseMultiplier(1, IQS7211E_ALP) &&
+      setATIFineDivider(1, IQS7211E_ALP) &&
+      setATICompensationDivider(4, IQS7211E_ALP) &&
+      setATIDriftLimit(20, IQS7211E_ALP) && setATITarget(200, IQS7211E_ALP);
+
+  configured = configured && setReportRate(20) &&
+               setReportRate(50, IQS7211E_MODE_IDLE_TOUCH) &&
+               setReportRate(20, IQS7211E_MODE_IDLE) &&
+               setReportRate(80, IQS7211E_MODE_LP1) &&
+               setReportRate(160, IQS7211E_MODE_LP2) &&
+               setModeTimeout(IQS7211E_MODE_ACTIVE, 0) &&
+               setModeTimeout(IQS7211E_MODE_IDLE_TOUCH, 0) &&
+               setModeTimeout(IQS7211E_MODE_IDLE, 0) &&
+               setModeTimeout(IQS7211E_MODE_LP1, 0) &&
+               setReferenceUpdateTime(8) && setATIRetryTime(5) &&
+               setCommunicationTimeout(100) &&
+               setPowerMode(IQS7211E_MODE_ACTIVE) && enableTXTest(false) &&
+               enableManualMode(true) && enableEventMode(false) &&
+               enableWatchdog(true) && enableCommandTermination(true) &&
+               enableCommunicationRequest(false) && enableAutoATI(true) &&
+               enableAutoATI(false, IQS7211E_ALP) &&
+               enableEvent(IQS7211E_EVENT_GESTURE, false) &&
+               enableEvent(IQS7211E_EVENT_TRACKPAD, false) &&
+               enableEvent(IQS7211E_EVENT_ATI, false) &&
+               enableEvent(IQS7211E_EVENT_ALP, false) &&
+               enableEvent(IQS7211E_EVENT_TOUCH, false) &&
+               setOscillator(IQS7211E_OSC_14MHZ) && setOscillatorAdjustment(0);
+
+  // ALP is configured but inactive while manual active mode is selected.
+  configured = configured && setALPSensingMethod(IQS7211E_MUTUAL_CAPACITIVE) &&
+               enableALPCountFilter(true) && setALPThreshold(8) &&
+               setALPDebounce(4, 4) && setALPCountBeta(IQS7211E_LP1, 220) &&
+               setALPReferenceBeta(IQS7211E_LP1, 8) &&
+               setALPCountBeta(IQS7211E_LP2, 240) &&
+               setALPReferenceBeta(IQS7211E_LP2, 16);
+  for (uint8_t pin = 0; pin < 8 && configured; pin++) {
+    bool enabled =
+        pin == 0 || pin == 1 || pin == 2 || pin == 4 || pin == 5 || pin == 6;
+    configured = enableALPReceiver(pin, enabled);
+  }
+  for (uint8_t pin = 0; pin < IQS7211E_MAX_ELECTRODES && configured; pin++) {
+    bool enabled = pin == 3 || pin >= 7;
+    configured = enableALPTransmitter(pin, enabled);
+  }
+
+  for (uint8_t index = 0; index < 2 && configured; index++) {
+    iqs7211e_sensor_t sensor = (iqs7211e_sensor_t)index;
+    configured = setConversionPeriod(26, sensor) &&
+                 setConversionFraction(127, sensor) &&
+                 enableNMStatic(false, sensor) &&
+                 enableHalfVoltDischarge(false, sensor) &&
+                 enableRFFilter(false, sensor) &&
+                 setChargeCapacitor(IQS7211E_CAP_80PF, sensor) &&
+                 setOpampBias(IQS7211E_BIAS_10UA, sensor) &&
+                 setCountLimit(IQS7211E_COUNT_1023, sensor) &&
+                 setInitialDelay(IQS7211E_INIT_64, sensor);
+  }
+  configured = configured &&
+               setAutoProxCycles(IQS7211E_LP1, IQS7211E_AUTOPROX_DISABLED) &&
+               setAutoProxCycles(IQS7211E_LP2, IQS7211E_AUTOPROX_DISABLED) &&
+               setElectrodeCounts(6, 7) && setMaxTouches(2) &&
+               setTouchThresholds(24, 20) && setResolution(1000, 1000) &&
+               setOrientation(false, false, true) && enableMAVFilter(true) &&
+               enableIIRFilter(true) && enableStaticIIR(false) &&
+               setDynamicFilterSpeeds(6, 124) && setDynamicFilterBeta(7) &&
+               setStaticFilterBeta(128) && setFingerSplitFactor(1) &&
+               setStationaryThreshold(20) && setEdgeTrim(IQS7211E_AXIS_X, 0) &&
+               setEdgeTrim(IQS7211E_AXIS_Y, 0) && setSettingsVersion(0, 2);
+
+  // Gesture detection is disabled; these are the starting values if enabled.
+  configured = configured &&
+               enableGesture(IQS7211E_GESTURE_SINGLE_TAP, false) &&
+               enableGesture(IQS7211E_GESTURE_DOUBLE_TAP, false) &&
+               enableGesture(IQS7211E_GESTURE_TRIPLE_TAP, false) &&
+               enableGesture(IQS7211E_GESTURE_HOLD, false) &&
+               enableGesture(IQS7211E_GESTURE_PALM, false) &&
+               enableGesture(IQS7211E_GESTURE_SWIPE_X_POS, false) &&
+               enableGesture(IQS7211E_GESTURE_SWIPE_X_NEG, false) &&
+               enableGesture(IQS7211E_GESTURE_SWIPE_Y_POS, false) &&
+               enableGesture(IQS7211E_GESTURE_SWIPE_Y_NEG, false) &&
+               enableGesture(IQS7211E_GESTURE_SWIPE_HOLD_X_POS, false) &&
+               enableGesture(IQS7211E_GESTURE_SWIPE_HOLD_X_NEG, false) &&
+               enableGesture(IQS7211E_GESTURE_SWIPE_HOLD_Y_POS, false) &&
+               enableGesture(IQS7211E_GESTURE_SWIPE_HOLD_Y_NEG, false) &&
+               setTapTime(150) && setAirTime(150) && setTapDistance(50) &&
+               setHoldTime(300) && setSwipeTime(150) &&
+               setSwipeInitialDistance(IQS7211E_AXIS_X, 200) &&
+               setSwipeInitialDistance(IQS7211E_AXIS_Y, 200) &&
+               setSwipeConsecutiveDistance(IQS7211E_AXIS_X, 100) &&
+               setSwipeConsecutiveDistance(IQS7211E_AXIS_Y, 100) &&
+               setSwipeAngle(23) && setPalmThreshold(30);
+
+  // RX rows bottom-to-top, then TX columns left-to-right.
+  const uint8_t mapping[IQS7211E_MAX_ELECTRODES] = {0,  1,  2, 6, 4, 5, 12,
+                                                    11, 10, 9, 8, 7, 3};
+  configured = configured && setElectrodeMapping(mapping);
+  // Pair one block A row with one block B row on the same transmitter.
+  for (uint8_t cycle = 0; cycle < IQS7211E_SENSING_CYCLES && configured;
+       cycle++) {
+    uint8_t channel = (cycle / 3) * 6 + cycle % 3;
+    configured = setSensingCycle(cycle, channel, channel + 3);
+  }
+  if (!configured) {
+    endConfiguration();
     return false;
   }
 
   // Section 9.3.1: acknowledge reset only after replacing the settings.
   Adafruit_BusIO_Register system(_i2c, IQS7211E_REG_SYSTEM, 2, LSBFIRST);
   bool written = system.write(IQS7211E_COMMAND_ACK_RESET);
-  bool ended = endCommunication();
+  finishSetting(written);
+  bool ended = endConfiguration();
   if (!written || !ended) {
     _error = IQS7211E_ERROR_I2C;
     return false;
@@ -69,7 +233,6 @@ bool Adafruit_IQS7211E::begin(TwoWire* wire, int16_t readyPin) {
 
   _initialized = true;
   if (!calibrate()) {
-    _initialized = false;
     return false;
   }
   _error = IQS7211E_ERROR_NONE;
@@ -81,14 +244,13 @@ bool Adafruit_IQS7211E::begin(TwoWire* wire, int16_t readyPin) {
  * @return 1112 for IQS7211E, another product number, or 0 on a failed read.
  */
 uint16_t Adafruit_IQS7211E::getProductNumber() {
-  if (!_i2c) {
+  if (!prepareCommunication(false)) {
     return 0;
   }
   Adafruit_BusIO_Register product(_i2c, IQS7211E_REG_PRODUCT, 2, LSBFIRST);
   uint16_t value;
   bool read = product.read(&value);
-  bool ended = endCommunication();
-  if (!read || !ended || value == IQS7211E_INVALID_WORD) {
+  if (!finishSetting(read && value != IQS7211E_INVALID_WORD)) {
     return 0;
   }
   return value;
@@ -97,15 +259,14 @@ uint16_t Adafruit_IQS7211E::getProductNumber() {
 /** @brief Read firmware major version. @return Version or -1 on read failure.
  */
 int16_t Adafruit_IQS7211E::getFirmwareMajor() {
-  if (!_i2c) {
+  if (!prepareCommunication(false)) {
     return -1;
   }
   Adafruit_BusIO_Register version(_i2c, IQS7211E_REG_VERSION_MAJOR, 2,
                                   LSBFIRST);
   uint16_t value;
   bool read = version.read(&value);
-  bool ended = endCommunication();
-  if (!read || !ended || value > 255) {
+  if (!finishSetting(read && value <= 255)) {
     return -1;
   }
   return value;
@@ -114,15 +275,14 @@ int16_t Adafruit_IQS7211E::getFirmwareMajor() {
 /** @brief Read firmware minor version. @return Version or -1 on read failure.
  */
 int16_t Adafruit_IQS7211E::getFirmwareMinor() {
-  if (!_i2c) {
+  if (!prepareCommunication(false)) {
     return -1;
   }
   Adafruit_BusIO_Register version(_i2c, IQS7211E_REG_VERSION_MINOR, 2,
                                   LSBFIRST);
   uint16_t value;
   bool read = version.read(&value);
-  bool ended = endCommunication();
-  if (!read || !ended || value > 255) {
+  if (!finishSetting(read && value <= 255)) {
     return -1;
   }
   return value;
@@ -134,6 +294,12 @@ int16_t Adafruit_IQS7211E::getFirmwareMinor() {
  * @note Section 9.3.2: reset occurs after the communication window ends.
  */
 bool Adafruit_IQS7211E::reset() {
+  if (_configuring) {
+    return argumentError();
+  }
+  if (_communicationRequest && !prepareCommunication(false)) {
+    return false;
+  }
   _initialized = false;
   _validData = false;
   if (!_i2c) {
@@ -143,6 +309,10 @@ bool Adafruit_IQS7211E::reset() {
   // Establish explicit window termination even after a previous host restart.
   Adafruit_BusIO_Register config(_i2c, IQS7211E_REG_CONFIG, 2, LSBFIRST);
   bool written = config.write(IQS7211E_CONFIG_POLLING);
+  if (written) {
+    _commandTermination = true;
+    _communicationRequest = false;
+  }
   // System-control is a command register: do not replay other command bits.
   Adafruit_BusIO_Register system(_i2c, IQS7211E_REG_SYSTEM, 2, LSBFIRST);
   if (written) {
@@ -163,68 +333,6 @@ bool Adafruit_IQS7211E::reset() {
 }
 
 /*!
- * @brief Replace all writable settings before starting calibration.
- * @return True when all profile, mapping and sensing-cycle bytes were sent.
- */
-bool Adafruit_IQS7211E::loadSettings() {
-  // Section 10.1.2 recommends replacing the complete writable memory map.
-  // Hold one communication window so the partially loaded profile cannot scan.
-  Adafruit_BusIO_Register config(_i2c, IQS7211E_REG_CONFIG, 2, LSBFIRST);
-  if (!config.write(IQS7211E_CONFIG_POLLING)) {
-    endCommunication();
-    return false;
-  }
-
-  bool written = true;
-  // 14 words plus an address fit even in the ATmega328 Wire transmit buffer.
-  uint16_t words[14];
-  for (uint8_t offset = 0; offset < 55 && written; offset += 14) {
-    uint8_t count = min((uint8_t)14, (uint8_t)(55 - offset));
-    for (uint8_t i = 0; i < count; i++) {
-#if defined(__AVR__) || defined(ESP8266)
-      // ESP8266 flash also requires the program-memory accessor.
-      words[i] = pgm_read_word(&iqs7211e_default_settings[offset + i]);
-#else
-      words[i] = iqs7211e_default_settings[offset + i];
-#endif
-    }
-    Adafruit_BusIO_Register settings(_i2c, IQS7211E_REG_CONFIG_START + offset,
-                                     2, LSBFIRST);
-    written = settings.write((uint8_t*)words, count * 2);
-  }
-
-  // Rev B, or Rev A with RX6/TX3 physically exchanged: bottom-to-top RX rows,
-  // then left-to-right TX columns. The middle row now uses physical RX6.
-  uint8_t mapping[14] = {0, 1, 2, 6, 4, 5, 12, 11, 10, 9, 8, 7, 3, 0};
-  Adafruit_BusIO_Register map(_i2c, IQS7211E_REG_MAPPING, 2, LSBFIRST);
-  if (written) {
-    written = map.write(mapping, sizeof(mapping));
-  }
-
-  // Each cycle has a control byte, one block A channel and one block B channel.
-  // Three rows in each block fit all 42 channels into 21 cycles
-  // (datasheet sections 7.1.2-7.1.4). Pair physical RX0/RX6, RX1/RX4,
-  // then RX2/RX5 for each transmitter; allocation uses logical row indices.
-  uint8_t cycles[64];
-  for (uint8_t cycle = 0; cycle < 21; cycle++) {
-    uint8_t tx = cycle / 3;
-    uint8_t rx = cycle % 3;
-    cycles[cycle * 3] = 0x05; // Required cycle control, section 12.
-    cycles[cycle * 3 + 1] = tx * 6 + rx;
-    cycles[cycle * 3 + 2] = tx * 6 + rx + 3;
-  }
-  cycles[63] = 0x01; // Required final control at 0x7C, not 0x05.
-  for (uint8_t offset = 0; offset < sizeof(cycles) && written; offset += 28) {
-    uint8_t length = min((uint8_t)28, (uint8_t)(sizeof(cycles) - offset));
-    Adafruit_BusIO_Register allocation(_i2c, IQS7211E_REG_CYCLES + offset / 2,
-                                       2, LSBFIRST);
-    written = allocation.write(cycles + offset, length);
-  }
-  bool ended = endCommunication();
-  return written && ended;
-}
-
-/*!
  * @brief Recalibrate the electrodes with a bounded wait; leave them untouched.
  * @param timeoutMS Maximum wait in milliseconds, excluding one bus transaction.
  * @return True when trackpad ATI finishes without an ATI error.
@@ -232,36 +340,49 @@ bool Adafruit_IQS7211E::loadSettings() {
  */
 bool Adafruit_IQS7211E::calibrate(uint16_t timeoutMS) {
   _validData = false;
+  if (_configuring) {
+    return argumentError();
+  }
   if (!_initialized) {
     _error = IQS7211E_ERROR_NOT_INITIALIZED;
     return false;
   }
   // Section 5.6.3: this command clears itself when trackpad ATI has completed.
   Adafruit_BusIO_Register system(_i2c, IQS7211E_REG_SYSTEM, 2, LSBFIRST);
-  bool written = system.write(IQS7211E_COMMAND_CALIBRATE);
-  bool ended = endCommunication();
-  if (!written || !ended) {
-    _error = IQS7211E_ERROR_I2C;
+  if (!queueATI()) {
     return false;
   }
   uint32_t start = millis();
+  bool complete = false;
   while (millis() - start < timeoutMS) {
     delay(10);
-    iqs7211e_system_t command;
-    bool read = system.read(&command.value);
-    if (!read || command.value == IQS7211E_INVALID_WORD) {
-      endCommunication();
-      continue; // Comms is unavailable while the ATI routine runs.
+    if (!prepareCommunication()) {
+      continue;
     }
-    // Use the named command field after a checked read; BusIO's field-only
-    // getter cannot distinguish an I2C failure from an asserted bit.
-    if (!command.bits.trackpadATI) {
-      // Keep this window open through the result read. This also keeps RDY
-      // asserted when an optional ready pin is used; readData ends the window.
-      return readData();
+    if (!complete) {
+      iqs7211e_system_t command;
+      bool read = system.read(&command.value);
+      if (!read || command.value == IQS7211E_INVALID_WORD) {
+        endCommunication();
+        continue; // Comms is unavailable while the ATI routine runs.
+      }
+      // A checked snapshot distinguishes an invalid window from an ATI bit.
+      complete = !command.bits.trackpadATI;
+      if (!complete) {
+        if (!endCommunication()) {
+          _error = IQS7211E_ERROR_I2C;
+          return false;
+        }
+        continue;
+      }
     }
-    if (!endCommunication()) {
-      _error = IQS7211E_ERROR_I2C;
+    // In command mode this uses the same window. In STOP mode the status
+    // read closed that window, so wait for a new RDY without consuming it
+    // with another status read. Only calibration uses this bounded retry.
+    if (readData()) {
+      return true;
+    }
+    if (_error != IQS7211E_ERROR_NOT_READY) {
       return false;
     }
   }
@@ -282,6 +403,13 @@ bool Adafruit_IQS7211E::readData() {
   _validData = false;
   if (!_initialized) {
     _error = IQS7211E_ERROR_NOT_INITIALIZED;
+    return false;
+  }
+  if (_configuring) {
+    _error = IQS7211E_ERROR_NOT_READY;
+    return false;
+  }
+  if (!prepareCommunication()) {
     return false;
   }
   if (_readyPin >= 0 && digitalRead(_readyPin) != LOW) {
@@ -379,7 +507,7 @@ bool Adafruit_IQS7211E::tooManyFingers() const {
   return _validData && _frame.data.info.tooManyFingers;
 }
 
-/** @brief Get the last acquisition/initialization outcome. @return Error code.
+/** @brief Get the last device-operation outcome. @return Error code.
  */
 iqs7211e_error_t Adafruit_IQS7211E::getLastError() const {
   return _error;
@@ -388,6 +516,12 @@ iqs7211e_error_t Adafruit_IQS7211E::getLastError() const {
 /** @brief Release the communication window (datasheet section 11.7). @return
  * True if the end command was acknowledged. */
 bool Adafruit_IQS7211E::endCommunication() {
+  if (!_i2c) {
+    return false;
+  }
+  if (_configuring || !_commandTermination) {
+    return true;
+  }
   Adafruit_BusIO_Register end(_i2c, IQS7211E_REG_END_COMMS);
   return end.write((uint32_t)0, 1);
 }
@@ -428,7 +562,15 @@ bool Adafruit_IQS7211E::readATICompensation(
  * @return True on a complete read.
  */
 bool Adafruit_IQS7211E::readChannelBank(uint8_t bank, uint16_t* values) {
-  if (!_i2c || !values) {
+  if (!values) {
+    return argumentError();
+  }
+  // Multiple chunks must share one scan. STOP-terminated windows cannot
+  // guarantee this, so require explicit command termination for bank reads.
+  if (!_commandTermination) {
+    return argumentError();
+  }
+  if (!prepareCommunication(false)) {
     return false;
   }
   bool read = true;
@@ -440,174 +582,13 @@ bool Adafruit_IQS7211E::readChannelBank(uint8_t bank, uint16_t* values) {
     read = _i2c->write_then_read(pointer, sizeof(pointer),
                                  (uint8_t*)(values + offset), 28);
   }
-  bool ended = endCommunication();
-  if (read && ended) {
+  if (read) {
     for (uint8_t i = 0; i < IQS7211E_CHANNELS; i++) {
       if (values[i] == IQS7211E_INVALID_WORD) {
-        return false;
+        read = false;
+        break;
       }
     }
   }
-  return read && ended;
-}
-
-/*!
- * @brief Set the coordinate ranges; this does not change physical resolution.
- * @param x Nonzero X coordinate range, default 1000.
- * @param y Nonzero Y coordinate range, default 1000.
- * @return True if both registers were written.
- * @note Both registers change within one communication window. Cached touch
- * data is invalidated because its coordinates use the previous ranges.
- */
-bool Adafruit_IQS7211E::setResolution(uint16_t x, uint16_t y) {
-  if (!_initialized || !x || !y) {
-    return false;
-  }
-  _validData = false;
-  Adafruit_BusIO_Register xRange(_i2c, IQS7211E_REG_X_RESOLUTION, 2, LSBFIRST);
-  Adafruit_BusIO_Register yRange(_i2c, IQS7211E_REG_Y_RESOLUTION, 2, LSBFIRST);
-  bool written = xRange.write(x) && yRange.write(y);
-  bool ended = endCommunication();
-  return written && ended;
-}
-
-/** @brief Read the configured X range. @return Range, or 0 on read failure. */
-uint16_t Adafruit_IQS7211E::getXResolution() {
-  if (!_initialized) {
-    return 0;
-  }
-  Adafruit_BusIO_Register range(_i2c, IQS7211E_REG_X_RESOLUTION, 2, LSBFIRST);
-  uint16_t value;
-  bool read = range.read(&value);
-  bool ended = endCommunication();
-  if (!read || !ended || value == IQS7211E_INVALID_WORD) {
-    return 0;
-  }
-  return value;
-}
-
-/** @brief Read the configured Y range. @return Range, or 0 on read failure. */
-uint16_t Adafruit_IQS7211E::getYResolution() {
-  if (!_initialized) {
-    return 0;
-  }
-  Adafruit_BusIO_Register range(_i2c, IQS7211E_REG_Y_RESOLUTION, 2, LSBFIRST);
-  uint16_t value;
-  bool read = range.read(&value);
-  bool ended = endCommunication();
-  if (!read || !ended || value == IQS7211E_INVALID_WORD) {
-    return 0;
-  }
-  return value;
-}
-
-/*!
- * @brief Set touch sensitivity and release hysteresis (datasheet section 5.4).
- * @param set Touch threshold as a fraction of reference counts, in 1/128 units.
- * Range 1-255; smaller values are more sensitive. Default 24.
- * @param clear Release threshold, in 1/128 units. Must be below set.
- * Default 20.
- * @return True if both fields were written.
- */
-bool Adafruit_IQS7211E::setTouchThresholds(uint8_t set, uint8_t clear) {
-  if (!_initialized || !set || clear >= set) {
-    return false;
-  }
-  Adafruit_BusIO_Register thresholds(_i2c, IQS7211E_REG_THRESHOLDS, 2,
-                                     LSBFIRST);
-  Adafruit_BusIO_RegisterBits setThreshold(&thresholds, 8, 0);
-  Adafruit_BusIO_RegisterBits clearThreshold(&thresholds, 8, 8);
-  bool written = setThreshold.write(set) && clearThreshold.write(clear);
-  bool ended = endCommunication();
-  return written && ended;
-}
-
-/*!
- * @brief Read the touch set threshold in 1/128 units.
- * @return Threshold; 255 also indicates a failed read (BusIO field sentinel).
- */
-uint8_t Adafruit_IQS7211E::getTouchSetThreshold() {
-  if (!_initialized) {
-    return 255;
-  }
-  Adafruit_BusIO_Register thresholds(_i2c, IQS7211E_REG_THRESHOLDS, 2,
-                                     LSBFIRST);
-  Adafruit_BusIO_RegisterBits setThreshold(&thresholds, 8, 0);
-  uint8_t value = setThreshold.read();
-  if (!endCommunication()) {
-    return 255;
-  }
-  return value;
-}
-
-/*!
- * @brief Read the touch release threshold in 1/128 units.
- * @return Threshold; 255 also indicates a failed read (BusIO field sentinel).
- */
-uint8_t Adafruit_IQS7211E::getTouchClearThreshold() {
-  if (!_initialized) {
-    return 255;
-  }
-  Adafruit_BusIO_Register thresholds(_i2c, IQS7211E_REG_THRESHOLDS, 2,
-                                     LSBFIRST);
-  Adafruit_BusIO_RegisterBits clearThreshold(&thresholds, 8, 8);
-  uint8_t value = clearThreshold.read();
-  if (!endCommunication()) {
-    return 255;
-  }
-  return value;
-}
-
-/*!
- * @brief Set the active-mode report interval, not a software polling delay.
- * @param milliseconds Nonzero requested interval, default 20 ms. The actual
- * interval cannot be shorter than the chip's electrode scan time.
- * @return True if the register was written.
- */
-bool Adafruit_IQS7211E::setReportRate(uint16_t milliseconds) {
-  if (!_initialized || !milliseconds) {
-    return false;
-  }
-  Adafruit_BusIO_Register rate(_i2c, IQS7211E_REG_REPORT_RATE, 2, LSBFIRST);
-  bool written = rate.write(milliseconds);
-  bool ended = endCommunication();
-  return written && ended;
-}
-
-/** @brief Read the requested report interval. @return Milliseconds, or 0 on
- * failure. */
-uint16_t Adafruit_IQS7211E::getReportRate() {
-  if (!_initialized) {
-    return 0;
-  }
-  Adafruit_BusIO_Register rate(_i2c, IQS7211E_REG_REPORT_RATE, 2, LSBFIRST);
-  uint16_t value;
-  bool read = rate.read(&value);
-  bool ended = endCommunication();
-  if (!read || !ended || value == IQS7211E_INVALID_WORD) {
-    return 0;
-  }
-  return value;
-}
-
-/*!
- * @brief Configure output axes (datasheet section 7.5).
- * @param flipX Reverse X coordinates.
- * @param flipY Reverse Y coordinates.
- * @param swapXY True makes TX columns the X axis on this board (default).
- * @return True if all three fields were written.
- */
-bool Adafruit_IQS7211E::setOrientation(bool flipX, bool flipY, bool swapXY) {
-  if (!_initialized) {
-    return false;
-  }
-  _validData = false;
-  Adafruit_BusIO_Register trackpad(_i2c, IQS7211E_REG_TRACKPAD, 2, LSBFIRST);
-  Adafruit_BusIO_RegisterBits xReverse(&trackpad, 1, 0);
-  Adafruit_BusIO_RegisterBits yReverse(&trackpad, 1, 1);
-  Adafruit_BusIO_RegisterBits swap(&trackpad, 1, 2);
-  bool written =
-      xReverse.write(flipX) && yReverse.write(flipY) && swap.write(swapXY);
-  bool ended = endCommunication();
-  return written && ended;
+  return finishSetting(read);
 }
