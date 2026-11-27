@@ -7,7 +7,7 @@ coordinate ranges, touch thresholds, report intervals, and axis orientation.
 **Board wiring:** The default profile scans all 42 sensing points in 21 cycles.
 It requires Rev B or a Rev A board with the RX6/TX3 connections physically
 exchanged. Bottom-to-top receiver pins are 0,1,2,6,4,5; left-to-right transmitter
-pins are 12,11,10,9,8,7,3. An unmodified Rev A is not supported by this profile.
+pins are 12,11,10,9,8,7,3.
 
 The default profile is specific to this electrode layout. Sensitivity depends
 on the touch surface and overlay; bare soldermask on the diamond side can give
