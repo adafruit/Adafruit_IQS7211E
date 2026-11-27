@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IQS7211E · Live touch</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#10191b;color:#e7f2ed;font:16px system-ui,sans-serif}main{max-width:1000px;margin:0 auto;padding:32px 24px}header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}h1{font-size:26px;margin:0 0 6px}p{color:#acbdb8;line-height:1.5;margin:6px 0}.status{padding:9px 14px;border:1px solid #556662;border-radius:20px;white-space:nowrap}.live{color:#92e9bb;border-color:#43875e}.layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(210px,1fr);gap:28px;align-items:start}.pad-wrap{padding:20px;background:#182326;border:1px solid #425452;border-radius:24px}svg{display:block;width:100%;height:auto;overflow:visible}.origin{display:flex;justify-content:space-between;margin-top:14px;color:#b5c7c0;font-size:13px}.finger{padding:18px;background:#1d2c2e;border:1px solid #425452;border-radius:14px;margin-bottom:14px}.finger h2{font-size:17px;margin:0 0 12px}.finger[data-slot="0"] h2{color:#8ce4cc}.finger[data-slot="1"] h2{color:#ffbe84}.coords{font:24px ui-monospace,monospace;min-height:34px}.detail{font-size:14px;color:#b6c5bf;min-height:22px}.note{border-left:3px solid #d9b76a;padding:4px 0 4px 13px;margin:22px 0}button,a.button{background:#2b4445;color:#effff8;border:1px solid #63817a;border-radius:8px;padding:10px 14px;font:inherit;cursor:pointer;text-decoration:none}button:hover,a.button:hover{background:#395654}button:disabled{opacity:.5;cursor:wait}.controls{display:flex;gap:12px;flex-wrap:wrap;margin-top:22px}.small{font-size:13px}.marker text{font:bold 31px system-ui;fill:#10191b;text-anchor:middle;dominant-baseline:central}.marker circle{stroke:#f7fff9;stroke-width:3}.trail{fill:none;stroke-width:5;stroke-linecap:round;stroke-linejoin:round;opacity:.55}.label{font:17px system-ui;fill:#d7c58f}.foot{margin-top:22px;display:flex;gap:16px;flex-wrap:wrap}.foot a{color:#a5cfc3}@media(max-width:650px){main{padding:22px 14px}header{align-items:flex-start;flex-direction:column}.layout{grid-template-columns:1fr}.readouts{display:grid;grid-template-columns:1fr 1fr;gap:12px}.finger{padding:14px}.coords{font-size:20px}}
+</style>
+<main>
+<header><div><h1>IQS7211E · Live touch</h1><p>Repaired Rev A · 42 points · top view · connectors toward you</p></div><div id="status" class="status" role="status">Connecting…</div></header>
+<div class="layout">
+<section class="pad-wrap" aria-label="Live positions on the touchpad">
+<svg id="pad" viewBox="-25 -25 750 650" role="img" aria-label="Touchpad with all 42 points active, X increases right and Y increases upward.">
+<defs><pattern id="grid" width="100" height="120" patternUnits="userSpaceOnUse"><path d="M100 0H0V120" stroke="#345852" stroke-width="1" fill="none"/></pattern><clipPath id="clip"><rect width="700" height="600" rx="16"/></clipPath></defs>
+<rect width="700" height="600" rx="16" fill="#173a32" stroke="#799c88" stroke-width="2"/>
+<g clip-path="url(#clip)"><rect width="700" height="600" fill="url(#grid)"/>
+<polyline id="trail0" class="trail" stroke="#8ce4cc"/><polyline id="trail1" class="trail" stroke="#ffbe84"/></g>
+<g id="marker0" class="marker" visibility="hidden"><circle r="25" fill="#8ce4cc"/><text>1</text></g><g id="marker1" class="marker" visibility="hidden"><circle r="25" fill="#ffbe84"/><text>2</text></g>
+</svg>
+<div class="origin"><span>X 0 · Y 0</span><span>Connectors ↓</span><span>X 1000 · Y 0</span></div>
+</section>
+<aside><div class="readouts"><section class="finger" data-slot="0"><h2>● Finger 1</h2><div id="coords0" class="coords">—</div><div id="detail0" class="detail">Lifted</div></section><section class="finger" data-slot="1"><h2>● Finger 2</h2><div id="coords1" class="coords">—</div><div id="detail1" class="detail">Lifted</div></section></div><p id="summary">Waiting for the pad…</p><p class="note">All 42 sensing points are enabled, including the restored middle row.</p><p class="small">Coordinates: 0–1000 on each axis.<br>Strength is capacitive signal, not pressure.</p></aside>
+</div>
+<div class="controls"><button id="clear">Clear trails</button><button id="calibrate">Recalibrate</button></div>
+<p id="message" class="small">Touch with one or two fingers. Lift all fingers before recalibrating.</p>
+<div class="foot small"><span id="rate">Waiting for readings</span><a href="/serial/" target="_blank" rel="noopener">Serial monitor</a></div>
+</main>
+<script>
+const statusEl=document.getElementById('status'), summary=document.getElementById('summary');
+const trails=[[],[]];
+let lastFrame=0, frames=0, rateStart=performance.now(), connected=false, lastReconnect=0;
+const bridge=document.createElement('iframe'); bridge.hidden=true; bridge.title='Live serial connection';
+function clearTouches(){for(let i=0;i<2;i++){document.getElementById('marker'+i).setAttribute('visibility','hidden');document.getElementById('coords'+i).textContent='—';document.getElementById('detail'+i).textContent='Lifted';}}
+function setStatus(text,live=false){statusEl.textContent=text;statusEl.classList.toggle('live',live);}
+function clearTrails(){for(let i=0;i<2;i++){trails[i]=[];document.getElementById('trail'+i).setAttribute('points','');}}
+function receiveLine(text){
+  if(!text.startsWith('T,')){if(text.startsWith('ERROR:')||text.startsWith('Calibrating:')){clearTouches();setStatus(text);document.getElementById('message').textContent=text;}return;}
+  const fields=text.split(',').slice(1).map(Number);
+  if(fields.length!==9||fields.some(x=>!Number.isFinite(x))||fields[0]<0||fields[0]>2)return;
+  for(let i=0;i<2;i++){const o=1+i*4;if(fields[o]<0||fields[o]>1000||fields[o+1]<0||fields[o+1]>1000)return;}
+  lastFrame=performance.now();frames++;connected=true;setStatus('Live',true);
+  document.getElementById('message').textContent='Touch with one or two fingers. Lift all fingers before recalibrating.';
+  summary.textContent=fields[0]===0?'No fingers on the pad':fields[0]+' finger'+(fields[0]===1?'':'s')+' detected';
+  for(let i=0;i<2;i++){
+    const o=1+i*4,[x,y,strength,area]=fields.slice(o,o+4), marker=document.getElementById('marker'+i);
+    marker.setAttribute('visibility',area>0?'visible':'hidden');
+    if(area>0){const px=x*.7,py=600-y*.6;marker.setAttribute('transform',`translate(${px} ${py})`);trails[i].push([px,py,lastFrame]);document.getElementById('coords'+i).textContent=`${x}, ${y}`;document.getElementById('detail'+i).textContent=`Strength ${strength} · area ${area}`;}
+    else{document.getElementById('coords'+i).textContent='—';document.getElementById('detail'+i).textContent='Lifted';trails[i]=[];}
+  }
+}
+window.serialMonitorStreamReady=()=>{};
+window.serialMonitorReceive=event=>{if(event.kind==='data'&&event.complete)receiveLine(event.text.trim());if(event.kind==='status'){connected=event.connected&&event.baudrate===115200;if(!connected){clearTouches();setStatus(event.connected?'Select 115200 in Serial monitor':'Serial disconnected');}}};
+function connect(){lastReconnect=performance.now();bridge.src='/serial/stream?t='+Date.now();}
+document.getElementById('clear').onclick=clearTrails;
+document.getElementById('calibrate').onclick=async()=>{const button=document.getElementById('calibrate');button.disabled=true;clearTouches();clearTrails();document.getElementById('message').textContent='Lift all fingers; calibrating…';try{const result=await fetch('/serial/send',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'text=c&ending=none'});if(!result.ok)throw Error('Unable to send calibration command');}catch(error){document.getElementById('message').textContent=error.message;}finally{setTimeout(()=>{button.disabled=false;},2500);}};
+setInterval(()=>{const now=performance.now();for(let i=0;i<2;i++){trails[i]=trails[i].filter(p=>now-p[2]<1800);document.getElementById('trail'+i).setAttribute('points',trails[i].map(p=>p[0]+','+p[1]).join(' '));}if(now-lastFrame>700){clearTouches();summary.textContent='Waiting for fresh readings';if(connected)setStatus('Waiting for readings');}if(now-lastFrame>5000&&now-lastReconnect>5000)connect();if(now-rateStart>1000){document.getElementById('rate').textContent=Math.round(frames*1000/(now-rateStart))+' readings/s · RDY on D2';frames=0;rateStart=now;}},100);
+document.body.appendChild(bridge);connect();
+</script>
+</html>
